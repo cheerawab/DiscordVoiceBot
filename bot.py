@@ -26,9 +26,9 @@ from faster_whisper import WhisperModel
 import numpy as np
 from dotenv import load_dotenv
 
-from web import set_bot_ref, add_transcription, start_web_server
-
 load_dotenv()
+
+from web import set_bot_ref, add_transcription, start_web_server
 
 # ─── 設定 ───────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
