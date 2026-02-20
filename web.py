@@ -156,11 +156,16 @@ async def handle_sse(request):
                 await response.write(f"data: {data}\n\n".encode("utf-8"))
             except asyncio.TimeoutError:
                 # 心跳
-                await response.write(b": heartbeat\n\n")
-            except ConnectionResetError:
+                try:
+                    await response.write(b": heartbeat\n\n")
+                except (ConnectionResetError, ConnectionError, OSError, Exception):
+                    break
+            except (ConnectionResetError, ConnectionError, OSError,
+                    asyncio.CancelledError, Exception):
                 break
     finally:
-        _sse_queues.remove(queue)
+        if queue in _sse_queues:
+            _sse_queues.remove(queue)
 
     return response
 
