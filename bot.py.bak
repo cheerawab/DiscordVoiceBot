@@ -1,0 +1,417 @@
+"""
+Discord Voice Bot - 使用 Faster-Whisper 進行即時串流語音辨識 (STT)
+
+使用 discord.py + discord-ext-voice-recv 接收語音，
+搭配 Faster-Whisper (CTranslate2) 以滑動視窗方式進行即時串流辨識。
+
+Faster-Whisper 優勢：
+  - 推論速度比 OpenAI Whisper 快 4× 以上
+  - 記憶體使用量更低
+  - 支援 VAD 過濾，自動跳過靜音段
+
+運作模式：
+  - 每累積 CHUNK_SECONDS 秒音訊就送入 Whisper 辨識一次
+  - 說話中持續編輯同一則 Discord 訊息，呈現即時更新效果
+  - 靜音後固定最終辨識結果
+
+指令:
+  !join  - 讓機器人加入你所在的語音頻道，開始即時語音辨識
+  !leave - 讓機器人離開語音頻道
+"""
+
+import os
+import asyncio
+import time
+from collections import defaultdict
+
+import discord
+from discord.ext import commands
+from discord.ext.voice_recv import VoiceRecvClient, BasicSink, VoiceData
+from faster_whisper import WhisperModel
+import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── 設定 ───────────────────────────────────────────────
+TOKEN = os.getenv("DISCORD_TOKEN")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")   # tiny / base / small / medium / large-v3 / turbo
+COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8")      # float16 / int8 / int8_float16 / float32
+DEVICE = os.getenv("WHISPER_DEVICE", "auto")           # auto / cpu / cuda
+TEXT_CHANNEL_ID = os.getenv("TEXT_CHANNEL_ID")        # 可選：指定輸出辨識結果的文字頻道 ID
+LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh")        # 預設辨識語言
+
+# 串流辨識設定
+CHUNK_SECONDS = 3.0         # 每隔幾秒送辨識一次（越短越即時，但越耗效能）
+SILENCE_TIMEOUT = 1.5       # 靜音超過此秒數視為一段話結束，固定最終結果
+MIN_AUDIO_DURATION = 1.0    # 最短音訊長度（秒），過短則忽略
+OVERLAP_SECONDS = 1.0       # 與前一段重疊的秒數，避免斷句不完整
+SAMPLE_RATE = 48000          # Discord 語音取樣率
+CHANNELS = 2                 # Discord 語音聲道數（立體聲）
+SAMPLE_WIDTH = 2             # 16-bit PCM = 2 bytes
+WHISPER_SR = 16000           # Whisper 需要的取樣率
+
+# ─── 載入 Faster-Whisper 模型 ─────────────────────────────
+print(f"正在載入 Faster-Whisper 模型: {WHISPER_MODEL} (device={DEVICE}, compute_type={COMPUTE_TYPE}) ...")
+whisper_model = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type=COMPUTE_TYPE)
+print("Faster-Whisper 模型載入完成！")
+
+# ─── 降低 voice_recv 的日誌噪音 ─────────────────────────
+import logging
+logging.getLogger("discord.ext.voice_recv.reader").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.gateway").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.opus").setLevel(logging.WARNING)
+logging.getLogger("discord.ext.voice_recv.router").setLevel(logging.WARNING)
+
+# ─── Bot 設定 ────────────────────────────────────────────
+# Python 3.14 不再自動建立 event loop，需手動建立
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+
+# ─── 使用者語音狀態 ──────────────────────────────────────
+
+class UserVoiceState:
+    """追蹤每位使用者的語音緩衝區與即時辨識狀態"""
+
+    def __init__(self):
+        # 音訊緩衝區
+        self.buffer = bytearray()
+        self.last_packet_time: float = 0.0
+
+        # 串流辨識狀態
+        self.current_message: discord.Message | None = None  # 正在編輯的訊息
+        self.accumulated_text: str = ""                       # 此段已確認的文字
+        self.last_chunk_time: float = 0.0                     # 上次送辨識的時間
+        self.is_speaking: bool = False                         # 是否正在說話
+        self.processing: bool = False                          # 是否正在辨識中
+
+    def add_data(self, data: bytes):
+        self.buffer.extend(data)
+        self.last_packet_time = time.time()
+        if not self.is_speaking:
+            self.is_speaking = True
+            self.last_chunk_time = time.time()
+
+    def get_duration(self) -> float:
+        return len(self.buffer) / (SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+
+    def consume(self) -> bytes:
+        data = bytes(self.buffer)
+        self.buffer.clear()
+        return data
+
+    def consume_with_overlap(self) -> bytes:
+        """取出音訊，但保留尾部作為重疊區段"""
+        overlap_bytes = int(OVERLAP_SECONDS * SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+        data = bytes(self.buffer)
+        if len(self.buffer) > overlap_bytes:
+            # 保留最後 overlap 的部分
+            self.buffer = bytearray(self.buffer[-overlap_bytes:])
+        else:
+            self.buffer.clear()
+        return data
+
+    def is_silent_for(self, timeout: float) -> bool:
+        if self.last_packet_time == 0:
+            return False
+        return (time.time() - self.last_packet_time) > timeout
+
+    def time_since_last_chunk(self) -> float:
+        if self.last_chunk_time == 0:
+            return 0
+        return time.time() - self.last_chunk_time
+
+    def reset_session(self):
+        """重置此段對話狀態（保留 buffer 供下次使用）"""
+        self.current_message = None
+        self.accumulated_text = ""
+        self.is_speaking = False
+        self.processing = False
+
+
+# ─── PCM → Whisper 轉換工具 ─────────────────────────────
+
+def pcm_to_whisper_array(pcm_data: bytes) -> np.ndarray | None:
+    """將 PCM 音訊轉換為 Faster-Whisper 需要的 16kHz float32 mono numpy array"""
+    samples = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
+    if len(samples) == 0:
+        return None
+
+    # 立體聲 → 單聲道
+    if CHANNELS == 2:
+        samples = samples.reshape(-1, 2).mean(axis=1)
+
+    # 降取樣 48kHz → 16kHz
+    ratio = SAMPLE_RATE // WHISPER_SR  # 3
+    samples = samples[::ratio]
+
+    if len(samples) < int(WHISPER_SR * MIN_AUDIO_DURATION):
+        return None
+
+    return samples
+
+
+def run_whisper(audio: np.ndarray) -> str:
+    """同步執行 Faster-Whisper 推論，回傳辨識文字"""
+    segments, _info = whisper_model.transcribe(
+        audio,
+        language=LANGUAGE,
+        beam_size=5,
+        vad_filter=True,           # 使用 VAD 過濾靜音段
+        vad_parameters=dict(
+            min_silence_duration_ms=500,
+        ),
+    )
+    text = "".join(seg.text for seg in segments).strip()
+    return text
+
+
+# ─── 語音管理器（串流模式） ──────────────────────────────
+
+class VoiceManager:
+    """
+    即時串流語音辨識管理器。
+
+    運作流程：
+    1. 收到語音封包 → 累積到使用者的 buffer
+    2. 每隔 CHUNK_SECONDS 秒，取出 buffer 送 Whisper 辨識
+    3. 辨識結果即時更新（編輯）同一則 Discord 訊息
+    4. 偵測到靜音 → 固定最終結果，準備下一段
+    """
+
+    def __init__(self, text_channel: discord.TextChannel, bot_instance: commands.Bot):
+        self.text_channel = text_channel
+        self.bot_instance = bot_instance
+        self.user_states: dict[int, UserVoiceState] = defaultdict(UserVoiceState)
+        self._running = True
+        self._monitor_task: asyncio.Task | None = None
+
+    def start(self):
+        self._monitor_task = self.bot_instance.loop.create_task(self._monitor_loop())
+
+    def stop(self):
+        self._running = False
+        if self._monitor_task:
+            self._monitor_task.cancel()
+        self.user_states.clear()
+
+    def on_voice_data(self, member: discord.Member | discord.User | None, voice_data: VoiceData):
+        """BasicSink 回呼：收到 PCM 語音資料"""
+        if member is None:
+            return
+        pcm = voice_data.pcm
+        if pcm:
+            self.user_states[member.id].add_data(pcm)
+
+    async def _monitor_loop(self):
+        """主迴圈：偵測串流辨識時機與靜音結束"""
+        while self._running:
+            await asyncio.sleep(0.2)
+
+            for uid, state in list(self.user_states.items()):
+                if not state.is_speaking:
+                    continue
+
+                # 情況 1：靜音超時 → 最終辨識並固定結果
+                if state.is_silent_for(SILENCE_TIMEOUT):
+                    if state.get_duration() >= MIN_AUDIO_DURATION and not state.processing:
+                        state.processing = True
+                        pcm_data = state.consume()
+                        asyncio.create_task(self._finalize(uid, pcm_data, state))
+                    elif state.get_duration() < MIN_AUDIO_DURATION:
+                        # 剩餘音訊太短，直接結束此段
+                        state.buffer.clear()
+                        state.reset_session()
+
+                # 情況 2：累積足夠時間 → 串流辨識（中間結果）
+                elif (state.time_since_last_chunk() >= CHUNK_SECONDS
+                      and state.get_duration() >= MIN_AUDIO_DURATION
+                      and not state.processing):
+                    state.processing = True
+                    state.last_chunk_time = time.time()
+                    pcm_data = state.consume_with_overlap()
+                    asyncio.create_task(self._stream_transcribe(uid, pcm_data, state))
+
+    async def _stream_transcribe(self, user_id: int, pcm_data: bytes, state: UserVoiceState):
+        """串流辨識：中間結果，編輯同一則訊息"""
+        try:
+            audio = pcm_to_whisper_array(pcm_data)
+            if audio is None:
+                state.processing = False
+                return
+
+            text = await asyncio.get_running_loop().run_in_executor(None, run_whisper, audio)
+            if not text:
+                state.processing = False
+                return
+
+            # 組合：已確認文字 + 本次新辨識
+            display_text = (state.accumulated_text + text).strip()
+            if not display_text:
+                state.processing = False
+                return
+
+            member = self.text_channel.guild.get_member(user_id)
+            name = member.display_name if member else f"User#{user_id}"
+            content = f"🎙️ **{name}**：{display_text} ..."
+
+            if state.current_message is None:
+                # 第一次：發送新訊息
+                state.current_message = await self.text_channel.send(content)
+            else:
+                # 後續：編輯同一則訊息
+                await state.current_message.edit(content=content)
+
+            # 將本次結果加入已確認文字
+            state.accumulated_text += text
+
+        except Exception as e:
+            print(f"[串流辨識錯誤] user_id={user_id}: {e}")
+        finally:
+            state.processing = False
+
+    async def _finalize(self, user_id: int, pcm_data: bytes, state: UserVoiceState):
+        """最終辨識：靜音後固定結果"""
+        try:
+            audio = pcm_to_whisper_array(pcm_data)
+
+            # 組合最終文字
+            final_new = ""
+            if audio is not None:
+                final_new = await asyncio.get_running_loop().run_in_executor(None, run_whisper, audio)
+
+            final_text = (state.accumulated_text + final_new).strip()
+
+            if not final_text:
+                state.reset_session()
+                return
+
+            member = self.text_channel.guild.get_member(user_id)
+            name = member.display_name if member else f"User#{user_id}"
+            content = f"🎙️ **{name}**：{final_text}"
+
+            if state.current_message is None:
+                await self.text_channel.send(content)
+            else:
+                # 移除尾部 "..." 並固定最終結果
+                await state.current_message.edit(content=content)
+
+        except Exception as e:
+            print(f"[最終辨識錯誤] user_id={user_id}: {e}")
+        finally:
+            state.reset_session()
+
+
+# 儲存每個 guild 的 VoiceManager 實例
+voice_managers: dict[int, VoiceManager] = {}
+
+
+# ─── Bot 事件 ────────────────────────────────────────────
+
+@bot.event
+async def on_ready():
+    print(f"Bot 已上線：{bot.user} (ID: {bot.user.id})")
+    print("------")
+
+
+# ─── 指令 ────────────────────────────────────────────────
+
+@bot.command(name="join", help="讓機器人加入你所在的語音頻道")
+async def join(ctx: commands.Context):
+    # 檢查使用者是否在語音頻道
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.send("❌ 你必須先加入一個語音頻道！")
+        return
+
+    voice_channel = ctx.author.voice.channel
+
+    # 如果 Bot 已在某語音頻道，先斷開
+    if ctx.voice_client:
+        # 停止舊的 VoiceManager
+        old_mgr = voice_managers.pop(ctx.guild.id, None)
+        if old_mgr:
+            old_mgr.stop()
+        try:
+            ctx.voice_client.stop_listening()
+        except Exception:
+            pass
+        await ctx.voice_client.disconnect(force=True)
+        await asyncio.sleep(1)  # 等待斷線完全完成
+
+    # 使用 VoiceRecvClient 連接語音頻道（支援接收語音），加大 timeout 並重試
+    vc = None
+    for attempt in range(3):
+        try:
+            vc = await voice_channel.connect(cls=VoiceRecvClient, timeout=30.0)
+            break
+        except TimeoutError:
+            print(f"[語音連線] 第 {attempt + 1} 次嘗試超時...")
+            # 清理殘留的 voice_client
+            if ctx.voice_client:
+                try:
+                    await ctx.voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+    if vc is None:
+        await ctx.send("❌ 無法連接到語音頻道，請稍後再試。")
+        return
+
+    # 決定辨識結果輸出的文字頻道
+    text_channel = ctx.channel
+    if TEXT_CHANNEL_ID:
+        ch = bot.get_channel(int(TEXT_CHANNEL_ID))
+        if ch is not None:
+            text_channel = ch
+
+    # 建立 VoiceManager 並開始監聽
+    mgr = VoiceManager(text_channel, bot)
+    voice_managers[ctx.guild.id] = mgr
+
+    # 使用 BasicSink 接收 PCM 資料，回呼到 VoiceManager
+    sink = BasicSink(mgr.on_voice_data)
+    vc.listen(sink)
+    mgr.start()
+
+    await ctx.send(
+        f"✅ 已加入語音頻道：**{voice_channel.name}**\n"
+        f"🎧 開始監聽語音，辨識結果將顯示在此頻道。\n"
+        f"📝 模型：`{WHISPER_MODEL}` ｜語言：`{LANGUAGE}`"
+    )
+
+
+@bot.command(name="leave", help="讓機器人離開語音頻道")
+async def leave(ctx: commands.Context):
+    if not ctx.voice_client:
+        await ctx.send("❌ 我目前不在任何語音頻道中。")
+        return
+
+    # 停止 VoiceManager
+    mgr = voice_managers.pop(ctx.guild.id, None)
+    if mgr:
+        mgr.stop()
+
+    # 停止監聽並斷開連線
+    try:
+        ctx.voice_client.stop_listening()
+    except Exception:
+        pass
+    await ctx.voice_client.disconnect()
+    await ctx.send("👋 已離開語音頻道。")
+
+
+# ─── 啟動 ────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if not TOKEN:
+        print("錯誤：請在 .env 檔案中設定 DISCORD_TOKEN")
+        exit(1)
+    bot.run(TOKEN)
