@@ -38,6 +38,8 @@ DEVICE = os.getenv("WHISPER_DEVICE", "auto")           # auto / cpu / cuda
 TEXT_CHANNEL_ID = os.getenv("TEXT_CHANNEL_ID")        # 可選：指定輸出辨識結果的文字頻道 ID
 LANGUAGE = os.getenv("WHISPER_LANGUAGE", "zh")        # 預設辨識語言
 PROMPT_FILE = os.getenv("WHISPER_PROMPT_FILE", "prompt.txt")  # 提示詞檔案路徑
+if not os.path.isabs(PROMPT_FILE):
+    PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), PROMPT_FILE)
 
 def load_prompt() -> str | None:
     """每次辨識前從檔案動態載入 prompt，檔案不存在或為空則回傳 None"""

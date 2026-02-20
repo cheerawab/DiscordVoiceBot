@@ -22,6 +22,9 @@ MAX_LOG_SIZE = 200
 _sse_queues: list[asyncio.Queue] = []
 
 PROMPT_FILE = os.getenv("WHISPER_PROMPT_FILE", "prompt.txt")
+# 轉為絕對路徑（以本檔案所在目錄為基準）
+if not os.path.isabs(PROMPT_FILE):
+    PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), PROMPT_FILE)
 WEB_PORT = int(os.getenv("WEB_PORT", "8080"))
 WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
 
