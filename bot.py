@@ -51,7 +51,7 @@ def load_prompt() -> str | None:
 
 # 辨識設定
 SILENCE_TIMEOUT = 1.5       # 靜音超過此秒數視為一句話結束
-SILENCE_THRESHOLD = 0.01    # RMS 能量門檻，低於此值視為靜音（0.0~1.0）
+SILENCE_THRESHOLD = 0.015   # RMS 能量門檻，低於此值視為靜音（0.0~1.0）
 MIN_AUDIO_DURATION = 0.5    # 最短音訊長度（秒），過短則忽略
 SAMPLE_RATE = 48000          # Discord 語音取樣率
 CHANNELS = 2                 # Discord 語音聲道數（立體聲）
@@ -281,13 +281,61 @@ def run_whisper(audio: np.ndarray) -> str:
         audio,
         language=LANGUAGE,
         beam_size=1,              # 貪婪解碼，速度最快
-        vad_filter=False,         # 已用 RMS 做斷句，不需要 Whisper VAD
+        vad_filter=True,          # 啟用 Silero VAD 過濾靜音，減少幻覺
+        vad_parameters=dict(
+            min_silence_duration_ms=300,
+            speech_pad_ms=200,
+        ),
+        no_speech_threshold=0.5,  # 靜音判定門檻（越低越嚴格）
         initial_prompt=prompt,
     )
     text = "".join(seg.text for seg in segments).strip()
+
+    # 過濾 Whisper 已知的幻覺文字（YouTube 字幕殘留）
+    text = _filter_hallucinations(text)
+
     elapsed = time.time() - t0
     audio_len = len(audio) / WHISPER_SR
     print(f"  [Whisper] 辨識完成：{elapsed:.2f}s（音訊 {audio_len:.1f}s，RTF={elapsed/audio_len:.2f}）")
+    return text
+
+
+# Whisper 常見幻覺文字黑名單
+_HALLUCINATION_PATTERNS = [
+    "字幕提供",
+    "字幕由",
+    "Amara.org",
+    "amara.org",
+    "社群提供",
+    "感謝觀看",
+    "請訂閱",
+    "訂閱頻道",
+    "按讚",
+    "小鈴鐺",
+    "謝謝收看",
+    "下次再見",
+    "Thank you for watching",
+    "Please subscribe",
+    "Subtitles by",
+    "字幕組",
+    "翻譯字幕",
+    "CC字幕",
+]
+
+
+def _filter_hallucinations(text: str) -> str:
+    """過濾 Whisper 產生的幻覺文字"""
+    if not text:
+        return text
+    for pattern in _HALLUCINATION_PATTERNS:
+        if pattern in text:
+            # 如果整句話都是幻覺，直接清空
+            cleaned = text.replace(pattern, "").strip()
+            # 移除後若只剩標點或極短內容，視為全幻覺
+            stripped = cleaned.strip("，。、！？⋯…,. !?")
+            if len(stripped) <= 2:
+                return ""
+            text = cleaned
     return text
 
 
